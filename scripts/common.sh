@@ -1,44 +1,120 @@
 #!/bin/bash
-set -e
+# script that runs 
+# https://kubernetes.io/docs/setup/production-environment/container-runtime
 
-echo "=== Minimal Kubernetes Setup ==="
+# changes March 14 2023: introduced $PLATFORM to have this work on amd64 as well as arm64
 
-# Wait for cloud-init
-while [ ! -f /var/lib/cloud/instance/boot-finished ]; do
-    echo "Waiting for cloud-init..."
-    sleep 5
-done
+# setting MYOS variable
+MYOS=$(hostnamectl | awk '/Operating/ { print $3 }')
+OSVERSION=$(hostnamectl | awk '/Operating/ { print $4 }')
+# beta: building in ARM support
+[ $(arch) = aarch64 ] && PLATFORM=arm64
+[ $(arch) = x86_64 ] && PLATFORM=amd64
 
-# Basic packages
-apt-get update
-apt-get install -y curl wget
+sudo apt install -y jq
 
-# Install Docker (quick method)
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
-
-# Configure Docker
-mkdir -p /etc/docker
-cat <<EOF | tee /etc/docker/daemon.json
-{
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "storage-driver": "overlay2"
-}
+if [ $MYOS = "Ubuntu" ]
+then
+	### setting up container runtime prereq
+	cat <<- EOF | sudo tee /etc/modules-load.d/containerd.conf
+	overlay
+	br_netfilter
 EOF
 
-systemctl enable docker
-systemctl start docker
-usermod -aG docker vagrant
+	sudo modprobe overlay
+	sudo modprobe br_netfilter
 
-# Disable swap
-swapoff -a
-sed -i '/swap/d' /etc/fstab
+        # Setup required sysctl params, these persist across reboots.
+        cat <<- EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+        net.bridge.bridge-nf-call-iptables  = 1
+        net.ipv4.ip_forward                 = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+EOF
 
-# Install Kubernetes
-curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update
-apt-get install -y kubelet kubeadm kubectl
-apt-mark hold kubelet kubeadm kubectl
+        # Apply sysctl params without reboot
+        sudo sysctl --system
 
-echo "Minimal setup complete"
+        # (Install containerd)
+	# getting rid of hard coded version numbers
+	CONTAINERD_VERSION=$(curl -s https://api.github.com/repos/containerd/containerd/releases/latest | jq -r '.tag_name')
+	CONTAINERD_VERSION=${CONTAINERD_VERSION#v}
+        wget https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${PLATFORM}.tar.gz
+        sudo tar xvf containerd-${CONTAINERD_VERSION}-linux-${PLATFORM}.tar.gz -C /usr/local
+        # Configure containerd
+        sudo mkdir -p /etc/containerd
+        cat <<- TOML | sudo tee /etc/containerd/config.toml
+version = 2
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      discard_unpacked_layers = true
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+TOML
+
+RUNC_VERSION=$(curl -s https://api.github.com/repos/opencontainers/runc/releases/latest | jq -r '.tag_name')
+
+wget https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.${PLATFORM}
+sudo install -m 755 runc.${PLATFORM} /usr/local/sbin/runc
+# Restart containerd
+        wget https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+        sudo mv containerd.service /usr/lib/systemd/system/
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now containerd
+fi
+
+sudo ln -s /etc/apparmor.d/runc /etc/apparmor.d/disable/
+sudo apparmor_parser -R /etc/apparmor.d/runc
+
+
+touch /tmp/container.txt
+
+
+if ! [ -f /tmp/container.txt ]
+then
+	echo run ./setup-container.sh before running this script
+	exit 4
+fi
+
+# setting MYOS variable
+MYOS=$(hostnamectl | awk '/Operating/ { print $3 }')
+OSVERSION=$(hostnamectl | awk '/Operating/ { print $4 }')
+
+# detecting latest Kubernetes version
+KUBEVERSION=$(curl -s https://api.github.com/repos/kubernetes/kubernetes/releases/latest | jq -r '.tag_name')
+KUBEVERSION=${KUBEVERSION%.*}
+
+
+if [ $MYOS = "Ubuntu" ]
+then
+	echo RUNNING UBUNTU CONFIG
+	cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+	br_netfilter
+EOF
+	
+	sudo apt-get update && sudo apt-get install -y apt-transport-https curl
+	curl -fsSL https://pkgs.k8s.io/core:/stable:/${KUBEVERSION}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+	echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBEVERSION}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sleep 2
+
+	sudo apt-get update
+	sudo apt-get install -y kubelet kubeadm kubectl
+	sudo apt-mark hold kubelet kubeadm kubectl
+	sudo swapoff -a
+	
+	sudo sed -i 's/\/swap/#\/swap/' /etc/fstab
+fi
+
+# Set iptables bridging
+#sudo cat <<EOF >  /etc/sysctl.d/k8s.conf
+#net.bridge.bridge-nf-call-ip6tables = 1
+#net.bridge.bridge-nf-call-iptables = 1
+#EOF
+#sudo sysctl --system
+
+sudo crictl config --set \
+    runtime-endpoint=unix:///run/containerd/containerd.sock
+echo 'after initializing the control node, follow instructions and use kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml to install the calico plugin (control node only). On the worker nodes, use sudo kubeadm join ... to join'

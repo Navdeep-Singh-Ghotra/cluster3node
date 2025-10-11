@@ -50,6 +50,8 @@ Vagrant.configure("2") do |config|
       libvirt.cpus = 2
       libvirt.storage :file, :size => '20G'
     end
+    # PORT FORWARDING - This allows your host to access the API server
+    control.vm.network "forwarded_port", guest: 6443, host: 16443, auto_correct: true
 
     control.vm.provision "shell", path: "scripts/common.sh"
     control.vm.provision "shell", path: "scripts/control-plane.sh", run: 'always'

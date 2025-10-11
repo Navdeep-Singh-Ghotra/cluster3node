@@ -10,11 +10,14 @@ if [ -f /etc/kubernetes/admin.conf ]; then
 fi
 
 # Initialize cluster
+echo "enabliong containerd"
+    sudo systemctl start containerd
+    sudo systemctl enable containerd
 echo "Initializing Kubernetes control plane..."
-kubeadm init \
+sudo kubeadm init \
   --apiserver-advertise-address=192.168.100.10 \
   --pod-network-cidr=10.244.0.0/16 \
-  --ignore-preflight-errors=all
+  --ignore-preflight-errors=all --v=5
 
 # Setup kubectl
 mkdir -p /home/vagrant/.kube
@@ -22,7 +25,7 @@ cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
 # Install Flannel
-sudo -u vagrant kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+sudo -u vagrant kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
 
 # Remove taints
 sudo -u vagrant kubectl taint nodes --all node-role.kubernetes.io/control-plane-
